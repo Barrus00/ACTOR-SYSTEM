@@ -1,11 +1,8 @@
 #include <pthread.h>
-#include <semaphore.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <signal.h>
 #include "generic_queue.h"
 #include "err.h"
@@ -13,14 +10,13 @@
 #include "cacti.h"
 
 #define INIT_SYSTEM_ERROR (-3)
-
 #define NO_ACTIVE_SYSTEM (-4)
+#define INIT_SIGACTION (0)
+#define RESTORE_SIGACTION (1)
 
 struct thread_pool;
 
 typedef struct thread_pool tpool_t;
-
-size_t how_many_commands(actor_id_t actor_id);
 
 size_t how_many_messages(actor_id_t actor_id);
 
@@ -42,8 +38,6 @@ static __thread actor_id_t self_actor_id;
 bool is_system_alive;
 pthread_cond_t system_join = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t system_mutex = PTHREAD_MUTEX_INITIALIZER;
-bool are_pthread_set = false;
-bool waiting_join = false;
 bool signaled = false;
 
 void *safe_malloc(size_t size) {
@@ -67,9 +61,15 @@ typedef struct actor_state {
 } actor_state_t;
 
 void safe_destroy_actor(actor_state_t *actor) {
+    int res;
+
     if (actor != NULL) {
         if (actor->q != NULL) {
             free_queue(actor->q);
+        }
+
+        if ((res = pthread_mutex_destroy(&actor->mutex)) != 0) {
+            syserr(res, "Destroying actor mutex failed!\n");
         }
 
         free(actor);
@@ -94,7 +94,7 @@ actor_state_t* create_actor(actor_id_t id, role_t *role) {
 typedef struct vector {
     actor_state_t   **elements;
     size_t     max_size;
-    size_t     curr_size;
+    size_t     curr_size; // Ilosc zajetych komórek.
     size_t     how_many_dead;
     pthread_mutex_t vec_mutex;
 } vector;
@@ -131,8 +131,8 @@ void destroy_vector(vector *vec) {
     }
 }
 
+/* Podawaja rozmiar danego wektora */
 void v_size_up(vector *vec) {
-    printf("REALLOC MAN!\n");
     void *tmp_elements;
 
     vec->max_size *= 2;
@@ -150,6 +150,8 @@ void v_size_up(vector *vec) {
     vec->elements = tmp_elements;
 }
 
+/* Dodaje nowego aktora, o danej roli, do danego wektora.
+ * Zwraca numer utworzonego tak aktora. */
 actor_id_t add_act(vector *vec, role_t *role) {
     int res;
     actor_id_t act_id;
@@ -174,6 +176,8 @@ actor_id_t add_act(vector *vec, role_t *role) {
     return act_id;
 }
 
+
+/* Wyciagamy element z vektora o podanym id. (BIERZEMY MUTEX!) */
 actor_state_t *vector_get(vector *vec, size_t id) {
     int res;
     actor_state_t *tmp;
@@ -196,6 +200,8 @@ actor_state_t *vector_get(vector *vec, size_t id) {
     return tmp;
 }
 
+/* Wyciagamy element z vektora o podanym id, przy czym nie
+ * zabezpieczamy tej operacji mutexem */
 actor_state_t *vector_get_no_mutex(vector *vec, size_t id) {
     if (id <= vec->curr_size) {
         return vec->elements[id];
@@ -206,6 +212,7 @@ actor_state_t *vector_get_no_mutex(vector *vec, size_t id) {
 }
 
 
+// Ustawia stan podanego aktora na martwy.
 void actor_turn_dead(vector *vec, actor_id_t act_id) {
     int res;
 
@@ -220,7 +227,7 @@ void actor_turn_dead(vector *vec, actor_id_t act_id) {
     actor_state->is_dead = true;
 
     vec->how_many_dead++;
- //   printf("Actor %d, goes dead! \n", actor_id_self());
+
     if(vec->how_many_dead == vec->curr_size) {
         is_system_alive = false;
     }
@@ -246,12 +253,22 @@ struct thread_pool {
 };
 
 void *tpool_worker(void *arg) {
+    int res;
     tpool_t *tp = arg;
     pthread_mutex_lock(&system_mutex);
     pthread_mutex_unlock(&system_mutex);
 
     while (1) {
-        pthread_mutex_lock(&tp->mutex);
+        /* W pętli nieskończonej wątek najpierw patrzy czy jest praca do wykonania, czyli
+         * czy znajduje sie jakiś aktor na kolejce, który czeka na przetworzenie, jezeli nie ma pracy,
+         * a system dalej dziala to wieszamy się na zmiennej warunkowej, jeżeli jest praca
+         * to pobieramy id kolejnego aktora z kolejki i przetwarzamy k komunikatow z jego kolejki,
+         * gdzie k określa ile komunikatów było na jego kolejce w momencie rozpoczęcia przetwarzania,
+         * ostatni watek ktory skonczy pracę iniciuje sprzątanie systemu, przy czym nie rusza struktury
+         * puli wątków. */
+        if ((res = pthread_mutex_lock(&tp->mutex)) != 0) {
+            syserr(res, "Thread mutex failed!\n");
+        }
 
         while (is_empty(tp->work_q) && tp->still_running && is_system_alive && !signaled)
             pthread_cond_wait(&tp->work_cond, &tp->mutex);
@@ -267,7 +284,10 @@ void *tpool_worker(void *arg) {
         int nprompts = how_many_messages(act_id);
 
         self_actor_id = act_id;
-        pthread_mutex_unlock(&tp->mutex);
+
+        if ((res = pthread_mutex_unlock(&tp->mutex)) != 0) {
+            syserr(res, "Thread mutex failed!\n");
+        }
 
         execute_commands(act_id, nprompts);
         try_to_add_actor(act_id, tp);
@@ -276,11 +296,16 @@ void *tpool_worker(void *arg) {
     tp->active_threads_num--;
 
     if (tp->active_threads_num == 0) {
-        pthread_mutex_unlock(&tp->mutex);
+        if ((res = pthread_mutex_unlock(&tp->mutex)) != 0) {
+            syserr(res, "Thread mutex failed!\n");
+        }
+
         destroy_actor_system();
     }
     else {
-        pthread_mutex_unlock(&tp->mutex);
+        if ((res = pthread_mutex_unlock(&tp->mutex)) != 0) {
+            syserr(res, "Thread mutex failed!\n");
+        }
     }
 
     return NULL;
@@ -306,15 +331,11 @@ tpool_t *tpool_create(size_t active_threads_num) {
     new_tp->still_running = true;
     new_tp->threads = safe_malloc(sizeof(pthread_t) * active_threads_num);
 
-    if ((res = pthread_mutex_init(&(new_tp->mutex), NULL)) != 0) {
+    if ((res = pthread_mutex_init(&new_tp->mutex, NULL)) != 0) {
         syserr(res, "Thread pool mutex initalization failure!\n");
     }
 
-    if ((res = pthread_mutex_init(&(new_tp->mutex), NULL)) != 0) {
-        syserr(res, "Thread pool mutex initalization failure!\n");
-    }
-
-    if ((res = pthread_cond_init(&(new_tp->work_cond), NULL)) != 0) {
+    if ((res = pthread_cond_init(&new_tp->work_cond, NULL)) != 0) {
         syserr(res, "Thread pool conditional initialization failure!\n");
     }
 
@@ -332,9 +353,13 @@ void tpool_destroy(tpool_t *tp) {
         if (tp->work_q != NULL) {
             free_queue(tp->work_q);
         }
+
         if (tp->threads != NULL) {
+            printf("END!");
             for (size_t i = 0; i < tp->threads_num; i++) {
-                pthread_join(tp->threads[i], NULL);
+                if ((res = pthread_join(tp->threads[i], NULL)) != 0) {
+                    syserr(res, "Thread join failed!\n");
+                }
             }
 
             free(tp->threads);
@@ -358,11 +383,12 @@ tpool_t *thread_pool = NULL;
 vector *actors = NULL;
 
 void catch_signal() {
-    printf("STOPPED!\n");
     signaled = true;
     pthread_cond_broadcast(&thread_pool->work_cond);
 }
 
+
+/* Zwalnia pamięć odpowiedzalną za system aktorów, bez niszczenia struktury puli wątków */
 void destroy_actor_system() {
     int res;
     if ((res = pthread_mutex_lock(&system_mutex)) != 0) {
@@ -378,6 +404,7 @@ void destroy_actor_system() {
     }
 }
 
+/* Blokuje mutex aktora o podanym id. (PODNOSI MUTEX GLOBALNEJ TABLICY AKTOROW!) */
 void act_lock_mutex(actor_id_t actor_id) {
     int res;
     actor_state_t *actor_state = vector_get(actors, actor_id);
@@ -387,6 +414,8 @@ void act_lock_mutex(actor_id_t actor_id) {
     }
 }
 
+
+/* Zwalnia mutex aktora o podanym id. (PODNOSI MUTEX GLOBALNEJ TABLICY AKTOROW!) */
 void act_unlock_mutex(actor_id_t actor_id) {
     int res;
     actor_state_t *actor_state = vector_get(actors, actor_id);
@@ -396,6 +425,8 @@ void act_unlock_mutex(actor_id_t actor_id) {
     }
 }
 
+
+/* Blokuje mutex aktora o podanym id, bez podnoszenia mutexa globalnej tablicy aktorow */
 void act_lock_mutex_unsafe(actor_id_t actor_id) {
     int res;
     actor_state_t *actor_state = vector_get_no_mutex(actors, actor_id);
@@ -405,6 +436,7 @@ void act_lock_mutex_unsafe(actor_id_t actor_id) {
     }
 }
 
+/* Zwalnia mutex aktora o podanym id, bez podnoszenia mutexa globalnej tablicy aktorow */
 void act_unlock_mutex_unsafe(actor_id_t actor_id) {
     int res;
     actor_state_t *actor_state = vector_get_no_mutex(actors, actor_id);
@@ -414,7 +446,7 @@ void act_unlock_mutex_unsafe(actor_id_t actor_id) {
     }
 }
 
-
+/* Zaznacza, że aktor o podanym id, może już trafić spowrotem na kolejkę */
 void actor_end_work(actor_id_t actor_id) {
     actor_state_t *actor_state = vector_get(actors, actor_id);
 
@@ -425,7 +457,11 @@ void actor_end_work(actor_id_t actor_id) {
     act_unlock_mutex(actor_id);
 }
 
+/* Jezeli jest to mozliwe, dodaje aktora do kolejki, aby kolejny watek
+ * mogl zaczac na nim pracowac, dodatkowo sygnalizuje zmienną warunkową
+ * na której czekają wątki pracujące */
 void try_to_add_actor(actor_id_t actor_id, tpool_t *tp) {
+    int res;
     actor_state_t *actor_state = vector_get(actors, actor_id);
 
     act_lock_mutex(actor_id);
@@ -433,18 +469,25 @@ void try_to_add_actor(actor_id_t actor_id, tpool_t *tp) {
     if (!is_empty(actor_state->q) && !actor_state->is_already_on_queue) {
         actor_state->is_already_on_queue = true;
 
-        pthread_mutex_lock(&tp->mutex);
+        if ((res = pthread_mutex_lock(&tp->mutex)) != 0) {
+            syserr(res, "Actor mutex failed!\n");
+        }
 
         queue_add(tp->work_q, (void *) actor_state->id);
 
-        pthread_cond_signal(&tp->work_cond);
+        if ((res = pthread_cond_signal(&tp->work_cond)) != 0) {
+            syserr(res, "Thread signal failed!\n");
+        }
 
-        pthread_mutex_unlock(&tp->mutex);
+        if ((res = pthread_mutex_unlock(&tp->mutex)) != 0) {
+            syserr(res, "Actor mutex failed!\n");
+        }
     }
 
     act_unlock_mutex(actor_id);
 }
 
+/* Zwraca liczbę wiadomości, które są zakolejkowane u aktora o danym id */
 size_t how_many_messages(actor_id_t actor_id) {
     actor_state_t *actor_state = vector_get(actors, actor_id);
 
@@ -472,8 +515,8 @@ void execute_command(actor_id_t actor_id) {
         case MSG_GODIE :
             actor_turn_dead(actors, actor_id);
             break;
-        default:
 
+        default:
             actorState->role->prompts[msg->message_type](&actorState->stateptr, msg->nbytes, msg->data);
             break;
     }
@@ -481,8 +524,8 @@ void execute_command(actor_id_t actor_id) {
     free(msg);
 }
 
+// Wykonuje 'how_many' komunikatow z kolejki aktora o id 'actor_id'
 void execute_commands(actor_id_t actor_id, size_t how_many) {
-
     for (size_t i = 0; i < how_many; i++){
         execute_command(actor_id);
     }
@@ -494,13 +537,14 @@ int send_message(actor_id_t actor, message_t message) {
     if (!is_system_alive) {
         return NO_ACTIVE_SYSTEM;
     }
-    else if (actor >= actors->curr_size) {
-        return -1;
+    else if (actor > actors->curr_size) {
+        return -2;
     }
     else {
         actor_state_t *act = vector_get(actors, actor);
+
         if (act->is_dead || signaled) {
-            return -2;
+            return -1;
         }
         else {
             message_t *allocated_message = safe_malloc(sizeof (message_t));
@@ -517,18 +561,19 @@ int send_message(actor_id_t actor, message_t message) {
     }
 }
 
+/* Ustawia nowe zachowanie procesu, po otrzymaniu sygnalu SIGINT, lub przywraca domyślne */
 void proc_mask(int type) {
     static struct sigaction newhandler, old_handler;
     newhandler.sa_handler = &catch_signal;
     sigemptyset(&(newhandler.sa_mask));
     newhandler.sa_flags = 0;
 
-    if (type == 0) {
+    if (type == INIT_SIGACTION) {
         if (sigaction(SIGINT, &newhandler, &old_handler) != -1) {
             printf("New handler set!\n");
         }
     }
-    else {
+    else if (type == RESTORE_SIGACTION) {
         if (sigaction(SIGINT, &old_handler, NULL) != -1) {
             printf("Old handler set!\n");
         }
@@ -537,29 +582,33 @@ void proc_mask(int type) {
 }
 
 int actor_system_create(actor_id_t *actor, role_t *const role) {
-      pthread_mutex_lock(&system_mutex);
-      if (actors != NULL) {
-          return INIT_SYSTEM_ERROR;
-      }
-      is_system_alive = true;
+    pthread_mutex_lock(&system_mutex);
 
-      thread_pool = tpool_create(POOL_SIZE);
-      actors = create_vector();
-      actor_id_t new_actor = add_act(actors, role);
-      signaled = false;
-      message_t hello = {.message_type = MSG_HELLO,
+    // Sprawdzamy, czy nie istnieje juz przypadkiem inny system aktorow.
+    if (actors != NULL) {
+        pthread_mutex_unlock(&system_mutex);
+        return INIT_SYSTEM_ERROR;
+    }
+
+    is_system_alive = true;
+    signaled = false;
+    thread_pool = tpool_create(POOL_SIZE);
+    actors = create_vector();
+    actor_id_t new_actor = add_act(actors, role);
+
+    message_t hello = {.message_type = MSG_HELLO,
                          .nbytes = 0,
                          .data = NULL};
 
-      send_message(new_actor, hello);
+    send_message(new_actor, hello);
 
-      proc_mask(0);
+    proc_mask(INIT_SIGACTION);
 
-      pthread_mutex_unlock(&system_mutex);
+    pthread_mutex_unlock(&system_mutex);
 
-      *actor = new_actor;
+    *actor = new_actor;
 
-      return 0;
+    return 0;
 }
 
 void actor_system_join(actor_id_t actor) {
@@ -569,18 +618,24 @@ void actor_system_join(actor_id_t actor) {
         syserr(res, "System mutex failed!\n");
     }
 
-    printf("WAITIN FOR JOIN!\n");
-    while (actors != NULL) {
+  /*  // Sprwadzamy czy numer aktora nalezy do systemu.
+    if (thread_pool == NULL ||
+        (actors != NULL && (actor < 0 || actors->curr_size > (size_t) actor))) {
+        if ((res = pthread_mutex_unlock(&system_mutex))) {
+            syserr(res, "System mutex failed!\n");
+        }
 
+        return;
+    }*/
+
+    while (actors != NULL) {
         pthread_cond_wait(&system_join, &system_mutex);
     }
-
-    printf("WAITIN IS NO MORE!\n");
 
     if (thread_pool != NULL) {
         tpool_destroy(thread_pool);
         thread_pool = NULL;
-        proc_mask(1);
+        proc_mask(RESTORE_SIGACTION);
         signaled = false;
     }
 
@@ -591,3 +646,4 @@ void actor_system_join(actor_id_t actor) {
 
 actor_id_t actor_id_self() {
     return self_actor_id;
+}
