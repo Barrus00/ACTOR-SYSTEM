@@ -1,7 +1,6 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
 #include "generic_queue.h"
@@ -35,10 +34,10 @@ void act_unlock_mutex_unsafe(actor_id_t actor_id);
 void destroy_actor_system();
 
 static __thread actor_id_t self_actor_id;
-bool is_system_alive;
 pthread_cond_t system_join = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t system_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool signaled = false;
+bool is_system_alive;
 
 void *safe_malloc(size_t size) {
     void *space = malloc(size);
@@ -81,7 +80,7 @@ actor_state_t* create_actor(actor_id_t id, role_t *role) {
 
     new_actor->id = id;
     new_actor->role = role;
-    new_actor->q = create_queue();
+    new_actor->q = create_queue((void *) ACTOR_QUEUE_LIMIT);
     new_actor->is_dead = false;
     new_actor->stateptr = NULL;
     new_actor->is_already_on_queue = false;
@@ -155,6 +154,7 @@ void v_size_up(vector *vec) {
 actor_id_t add_act(vector *vec, role_t *role) {
     int res;
     actor_id_t act_id;
+
     if ((res = pthread_mutex_lock(&vec->vec_mutex)) != 0) {
         syserr(res, "Locking mutex failed! (Add_act)\n");
     }
@@ -165,6 +165,7 @@ actor_id_t add_act(vector *vec, role_t *role) {
     if (vec->curr_size == vec->max_size) {
         v_size_up(vec);
     }
+
     act_id = vec->curr_size;
     vec->elements[act_id] = create_actor(act_id, role);
     vec->curr_size++;
@@ -255,8 +256,14 @@ struct thread_pool {
 void *tpool_worker(void *arg) {
     int res;
     tpool_t *tp = arg;
-    pthread_mutex_lock(&system_mutex);
-    pthread_mutex_unlock(&system_mutex);
+
+    if ((res = pthread_mutex_lock(&system_mutex)) != 0) {
+        syserr(res, "Thread 'SYSTEM' mutex failed!\n");
+    }
+
+    if ((res = pthread_mutex_unlock(&system_mutex)) != 0) {
+        syserr(res, "Thread 'SYSTEM' mutex failed!\n");
+    }
 
     while (1) {
         /* W pętli nieskończonej wątek najpierw patrzy czy jest praca do wykonania, czyli
@@ -270,12 +277,19 @@ void *tpool_worker(void *arg) {
             syserr(res, "Thread mutex failed!\n");
         }
 
-        while (is_empty(tp->work_q) && tp->still_running && is_system_alive && !signaled)
-            pthread_cond_wait(&tp->work_cond, &tp->mutex);
+        while (is_empty(tp->work_q) && tp->still_running && is_system_alive && !signaled) {
+            if((res = pthread_cond_wait(&tp->work_cond, &tp->mutex)) != 0) {
+                syserr(res, "Thread conditional wait failed!\n");
+            }
+        }
 
         if ((!is_system_alive || signaled) && is_empty(tp->work_q)) {
             tp->still_running = false;
-            pthread_cond_broadcast(&tp->work_cond);
+
+            if ((res = pthread_cond_broadcast(&tp->work_cond)) != 0) {
+                syserr(res, "Thread broadcast failed!\n");
+            }
+
             break;
         }
 
@@ -319,7 +333,7 @@ tpool_t *tpool_create(size_t active_threads_num) {
         exit(1);
     }
 
-    new_tp->work_q = create_queue(sizeof (actor_id_t));
+    new_tp->work_q = create_queue(NULL);
 
     if (!new_tp->work_q){
         fatal("Thread pool initialization failure!\n");
@@ -355,7 +369,6 @@ void tpool_destroy(tpool_t *tp) {
         }
 
         if (tp->threads != NULL) {
-            printf("END!");
             for (size_t i = 0; i < tp->threads_num; i++) {
                 if ((res = pthread_join(tp->threads[i], NULL)) != 0) {
                     syserr(res, "Thread join failed!\n");
@@ -397,7 +410,9 @@ void destroy_actor_system() {
 
     destroy_vector(actors);
     actors = NULL;
-    pthread_cond_signal(&system_join);
+    if ((res =  pthread_cond_signal(&system_join)) != 0) {
+        syserr(res, "Destroy system signal failed!\n");
+    }
 
     if ((res = pthread_mutex_unlock(&system_mutex)) != 0) {
         syserr(res, "Destroy system mutex failed!\n");
@@ -515,7 +530,6 @@ void execute_command(actor_id_t actor_id) {
         case MSG_GODIE :
             actor_turn_dead(actors, actor_id);
             break;
-
         default:
             actorState->role->prompts[msg->message_type](&actorState->stateptr, msg->nbytes, msg->data);
             break;
@@ -537,7 +551,7 @@ int send_message(actor_id_t actor, message_t message) {
     if (!is_system_alive) {
         return NO_ACTIVE_SYSTEM;
     }
-    else if (actor > actors->curr_size) {
+    else if (actor < 0 || (size_t) actor >= actors->curr_size) {
         return -2;
     }
     else {
@@ -553,7 +567,10 @@ int send_message(actor_id_t actor, message_t message) {
             allocated_message->nbytes = message.nbytes;
             allocated_message->message_type = message.message_type;
 
-            queue_add(act->q, (void *) allocated_message);
+            if(queue_add(act->q, (void *) allocated_message) == -1) {
+                free(allocated_message);
+            }
+
             try_to_add_actor(actor, thread_pool);
 
             return 0;
@@ -569,13 +586,13 @@ void proc_mask(int type) {
     newhandler.sa_flags = 0;
 
     if (type == INIT_SIGACTION) {
-        if (sigaction(SIGINT, &newhandler, &old_handler) != -1) {
-            printf("New handler set!\n");
+        if (sigaction(SIGINT, &newhandler, &old_handler) == -1) {
+            fatal("SIGACTION failed!\n");
         }
     }
     else if (type == RESTORE_SIGACTION) {
-        if (sigaction(SIGINT, &old_handler, NULL) != -1) {
-            printf("Old handler set!\n");
+        if (sigaction(SIGINT, &old_handler, NULL) == -1) {
+            fatal("SIGATION failed!\n");
         }
     }
 
@@ -618,18 +635,20 @@ void actor_system_join(actor_id_t actor) {
         syserr(res, "System mutex failed!\n");
     }
 
-  /*  // Sprwadzamy czy numer aktora nalezy do systemu.
+    // Sprwadzamy czy numer aktora nalezy do systemu.
     if (thread_pool == NULL ||
-        (actors != NULL && (actor < 0 || actors->curr_size > (size_t) actor))) {
+        (actors != NULL && (actor < 0 || actors->curr_size < (size_t) actor))) {
         if ((res = pthread_mutex_unlock(&system_mutex))) {
             syserr(res, "System mutex failed!\n");
         }
 
         return;
-    }*/
+    }
 
     while (actors != NULL) {
-        pthread_cond_wait(&system_join, &system_mutex);
+        if ((res = pthread_cond_wait(&system_join, &system_mutex))) {
+            syserr(res, "System wait failed!\n");
+        }
     }
 
     if (thread_pool != NULL) {
